@@ -1,17 +1,20 @@
-"""Provider credentials needed by nested Agent runtimes cross the SDK boundary."""
+"""Shared provider credentials reach the Agent through ABB-owned variables."""
 
-from contextlib import contextmanager
-import json
-import shutil
+import stat
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from agentbench.runtime.agentcontainer.config import AgentContainerConfig
 from agentbench.runtime.contracts import EnvironmentSecretResolver
+from agentbench.sdk.integration import runner as integration_runner
+from agentbench.runtime.docker.runtime import DockerRuntimeError, _container_environment
 from agentbench.sdk.plugin.native.plugin import plugin
 from agentbench.sdk.plugin.native.runner import NativeRunner
 
 
-def test_native_runner_forwards_selected_provider_credential_to_controller(tmp_path, monkeypatch):
+def test_shared_provider_credential_is_mapped_to_agent_variables(tmp_path):
     root = tmp_path / 'unit'
     root.mkdir()
     (root / 'agent.toml').write_text(
@@ -40,33 +43,91 @@ def test_native_runner_forwards_selected_provider_credential_to_controller(tmp_p
         'ABB_MODEL_PROVIDER': 'stepfun',
         'STEPFUN_API_KEY': secret,
     }
-    context = SimpleNamespace(environ=environ, model='step-5-preview')
-    agent = SimpleNamespace(path=root, agent_id='provider-fixture', framework='acp')
-    staged_root = tmp_path / 'staged'
+    runtime = AgentContainerConfig.from_agent_dir(
+        root, secret_resolver=EnvironmentSecretResolver(environ), environ=environ)
+    assert runtime.environment == {
+        'ABB_AGENT_MODEL_API_KEY': secret,
+        'ABB_AGENT_MODEL_BASE_URL': 'https://api.stepfun.com/step_plan/v1',
+        'ABB_AGENT_MODEL': 'step-5-preview',
+        'ABB_AGENT_MODEL_PROVIDER': 'stepfun',
+    }
+    assert 'STEPFUN_API_KEY' not in runtime.environment
+    assert 'worker_env_keys' not in (root / 'agent.toml').read_text()
 
-    @contextmanager
-    def stage_agent(source, **kwargs):
-        del kwargs
-        staged_root.mkdir()
-        shutil.copy2(source.path / 'agent.toml', staged_root / 'agent.toml')
-        shutil.copy2(source.path / 'Dockerfile', staged_root / 'Dockerfile')
-        yield SimpleNamespace(path=staged_root, agent_id=source.agent_id,
-                              framework=source.framework)
 
-    monkeypatch.setattr(plugin, 'stage_agent', stage_agent)
+def test_native_runner_excludes_model_key_from_controller(monkeypatch, tmp_path):
+    captured = {}
+
+    def run_evaluation(registration, **kwargs):
+        captured.update(kwargs)
+        return 'run result'
+
+    monkeypatch.setattr(integration_runner, 'run_evaluation', run_evaluation)
+    context = SimpleNamespace(environ={}, model='step-5-preview')
     runner = NativeRunner(plugin, context=context, options={})
-    with runner._stage_agent(context)(agent) as staged:
-        manifest_path = staged.path / 'agent.toml'
-        from agentbench.runtime.agentcontainer.config import tomllib
-        manifest = tomllib.loads(manifest_path.read_text())
-        assert manifest['runtime']['worker_env_keys'] == ['STEPFUN_API_KEY']
-        assert secret not in manifest_path.read_text()
+    result = runner._run(object(), settings={}, context=context, on_progress=None)
 
-        runtime = AgentContainerConfig.from_agent_dir(
-            staged.path, secret_resolver=EnvironmentSecretResolver(environ),
-            environ=environ)
-        assert runtime.environment['STEPFUN_API_KEY'] == secret
-        assert runtime.environment['ABB_AGENT_MODEL'] == 'step-5-preview'
+    assert result == 'run result'
+    assert captured['excluded_controller_environment'] == ('ABB_AGENT_MODEL_API_KEY',)
 
-    original = (root / 'agent.toml').read_text()
-    assert 'worker_env_keys' not in original
+
+def test_container_environment_keeps_values_out_of_docker_argv():
+    secret = '{{SYNTHETIC_PROVIDER_SECRET}}'
+    environ = {
+        'STEPFUN_API_KEY': secret,
+        'ABB_AGENT_MODEL': 'step-5-preview',
+        'SDK_PRIVATE_TOKEN': '{{SYNTHETIC_EXCLUDED_SECRET}}',
+    }
+    options, command_environment = _container_environment(
+        environ, excluded=('SDK_PRIVATE_TOKEN',))
+
+    assert options == ('--env', 'ABB_AGENT_MODEL', '--env', 'STEPFUN_API_KEY')
+    assert secret not in options
+    assert '{{SYNTHETIC_EXCLUDED_SECRET}}' not in command_environment.values()
+    assert command_environment == {
+        'STEPFUN_API_KEY': secret,
+        'ABB_AGENT_MODEL': 'step-5-preview',
+    }
+
+
+def test_container_environment_preserves_multiline_values():
+    value = 'first line\nsecond line\r\n'
+    options, command_environment = _container_environment({'MCP_TEST_VALUE': value})
+
+    assert options == ('--env', 'MCP_TEST_VALUE')
+    assert command_environment == {'MCP_TEST_VALUE': value}
+
+
+def test_docker_command_receives_values_in_environment_not_arguments(monkeypatch):
+    from agentbench.runtime.docker.command import DockerCommandRunner
+
+    secret = 'first line\nsecond line'
+    captured = {}
+
+    class Process:
+        def wait(self, timeout=None):
+            return 0
+
+        def poll(self):
+            return 0
+
+    runner = DockerCommandRunner(executable='docker', environ={'PATH': '/usr/bin'})
+
+    def start(arguments, **kwargs):
+        captured['arguments'] = arguments
+        captured['environment'] = kwargs['env']
+        return Process()
+
+    monkeypatch.setattr(runner, 'start', start)
+    result = runner.run(['create', '--env', 'MCP_TEST_VALUE', 'fixture'],
+                        extra_environ={'MCP_TEST_VALUE': secret}, timeout=1)
+
+    assert result.returncode == 0
+    assert secret not in captured['arguments']
+    assert captured['environment']['MCP_TEST_VALUE'] == secret
+
+
+@pytest.mark.parametrize('key,value', [('BAD=KEY', 'value'), ('MCP_TEST_VALUE', 'null\x00byte')])
+def test_container_environment_rejects_unrepresentable_entries(key, value):
+    with pytest.raises(DockerRuntimeError, match='valid names and NUL-free values'):
+        _container_environment({key: value})

@@ -1,6 +1,7 @@
 """Persistent Agent endpoint. Only current requests enter this container."""
 import asyncio
 import json
+import shutil
 from pathlib import Path
 
 from agentbench.observe.store import atomic_json
@@ -24,6 +25,12 @@ async def serve(root=Path('/opt/agent'), requests=REQUESTS, responses=RESPONSES)
     try:
         while True:
             request = requests / f'{sequence:08d}.json'
+            if sequence:
+                previous_request = requests / f'{sequence - 1:08d}.json'
+                previous_response = responses / f'{sequence - 1:08d}'
+                if (not previous_request.exists() and previous_response.is_dir()
+                        and not previous_response.is_symlink()):
+                    shutil.rmtree(previous_response)
             if not request.exists():
                 await asyncio.sleep(0.05)
                 continue
@@ -35,6 +42,9 @@ async def serve(root=Path('/opt/agent'), requests=REQUESTS, responses=RESPONSES)
                 share_output(folder)
                 atomic_json(folder / 'done.json',
                             {'sequence': sequence, 'session': session.snapshot()}, mode=0o644)
+                while request.exists():
+                    await asyncio.sleep(0.05)
+                shutil.rmtree(folder)
                 return
             exporter.destination = folder / 'spans.jsonl'
             await execute(root, request, folder, provider=provider, session=session,

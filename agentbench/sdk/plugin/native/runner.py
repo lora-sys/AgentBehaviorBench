@@ -1,6 +1,5 @@
 """Import user cases and reuse ABB's isolated runtime and evidence validation."""
 from dataclasses import replace
-from contextlib import contextmanager
 import json
 from pathlib import Path
 
@@ -35,43 +34,14 @@ class NativeRunner(ContainerSDKRunner):
                 raise ValueError('Case IDs must be unique')
         super().__init__(plugin, context=context, options=options)
 
-    def _stage_agent(self, context):
-        """Forward the selected shared provider credential into the controller.
-
-        The outer CLI resolves the model before starting this isolated SDK
-        container. The controller then starts the Agent in its own Docker
-        runtime, which needs the provider's original credential environment
-        name as well as ABB_AGENT_MODEL_* settings. Keep the value out of the
-        staged manifest; worker_env_keys forwards it from the host environment.
-        """
-        stage_agent = super()._stage_agent(context)
-        environ = dict(context.environ)
-        if context.model is not None:
-            environ['ABB_MODEL'] = context.model
-
-        @contextmanager
-        def stage(agent, **kwargs):
-            with stage_agent(agent, **kwargs) as descriptor:
-                from agentbench.runtime.agentcontainer.config import tomllib
-                from agentbench.runtime.docker.evaluation_image import extend_runtime_environment
-                from agentbench.runtime.interception.native_model import resolve_shared_model
-
-                manifest_path = Path(descriptor.path) / 'agent.toml'
-                source = manifest_path.read_text(encoding='utf-8')
-                target = resolve_shared_model(tomllib.loads(source), environ)
-                if target is not None:
-                    manifest = tomllib.loads(source)
-                    runtime = manifest.get('runtime', {})
-                    declared = {key for field in ('env_keys', 'secret_env_keys',
-                                                   'optional_secret_env_keys', 'worker_env_keys')
-                                for key in runtime.get(field, ())}
-                    if target.credential_env not in declared:
-                        source = extend_runtime_environment(
-                            source, (target.credential_env,), field='worker_env_keys')
-                        manifest_path.write_text(source, encoding='utf-8')
-                yield descriptor
-
-        return stage
+    def _run(self, registration, *, settings, context, on_progress, **kwargs):
+        excluded = tuple(dict.fromkeys((
+            *kwargs.pop('excluded_controller_environment', ()),
+            'ABB_AGENT_MODEL_API_KEY',
+        )))
+        return super()._run(registration, settings=settings, context=context,
+                            on_progress=on_progress,
+                            excluded_controller_environment=excluded, **kwargs)
 
     def prepare_cases(self, registration, **kwargs):
         cases = self.sdk_options.get('cases', [])

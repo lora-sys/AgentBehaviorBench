@@ -297,10 +297,19 @@ def test_mcp_environment_echo_is_redacted_from_channel_span_transport(tmp_path, 
             done = responses / '00000000' / 'done.json'
             await asyncio.wait_for(_wait_for_file(done), timeout=15)
             assert stat.S_IMODE(done.stat().st_mode) & 0o044 == 0o044
+
+            spans = (responses / '00000000' / 'spans.jsonl').read_text()
+            assert value not in spans
+            assert '[REDACTED]' in spans
+            (requests / '00000000.json').unlink()
+
             (requests / '00000001.json').write_text(json.dumps({'operation': 'close'}))
-            await asyncio.wait_for(channel, timeout=15)
             close_done = responses / '00000001' / 'done.json'
+            await asyncio.wait_for(_wait_for_file(close_done), timeout=15)
             assert stat.S_IMODE(close_done.stat().st_mode) & 0o044 == 0o044
+            (requests / '00000001.json').unlink()
+            await asyncio.wait_for(channel, timeout=15)
+            assert not (responses / '00000001').exists()
         finally:
             if not channel.done():
                 channel.cancel()
@@ -311,10 +320,6 @@ def test_mcp_environment_echo_is_redacted_from_channel_span_transport(tmp_path, 
         asyncio.run(run_channel())
     finally:
         os.umask(previous_umask)
-
-    spans = (responses / '00000000' / 'spans.jsonl').read_text()
-    assert value not in spans
-    assert '[REDACTED]' in spans
 
 
 async def _wait_for_file(path):
@@ -403,23 +408,54 @@ def test_host_runner_redacts_mcp_values_from_failure_events_and_errors():
 
 
 def test_mcp_values_are_written_to_interceptor_secret_files_not_json(tmp_path):
-    from agentbench.runtime.interception.service_config import prepare_service_config
+    import os
+    from agentbench.runtime.interception.service_config import prepare_service_config, write_mount_file
 
     value = '{{INTERCEPTOR_MCP_SECRET_3921}}'
     interception = SimpleNamespace(
         mode='observe', observation_headers={}, observation_tool_purposes={},
         routes=(), tool_routes=(), token_counting={}, credentials=(),
     )
-    data, environment = prepare_service_config(
-        interception, agent_id='host-fixture', max_trace_bytes=4096,
-        secret_dir=tmp_path, secret_resolver=None, environ={}, redaction_values=(value,),
-    )
+    secret_dir = tmp_path / 'private-secrets'
+    secret_dir.mkdir(mode=0o700)
+    previous_umask = os.umask(0o077)
+    try:
+        data, environment = prepare_service_config(
+            interception, agent_id='host-fixture', max_trace_bytes=4096,
+            secret_dir=secret_dir, secret_resolver=None, environ={}, redaction_values=(value,),
+        )
+        config_file = secret_dir / 'interceptor_config.json'
+        write_mount_file(config_file, json.dumps(data, ensure_ascii=False))
+    finally:
+        os.umask(previous_umask)
 
     assert environment == {}
     assert value not in json.dumps(data)
     assert len(data['redaction_secret_files']) == 1
-    secret_file = tmp_path / Path(data['redaction_secret_files'][0]).name
+    secret_file = secret_dir / Path(data['redaction_secret_files'][0]).name
     assert secret_file.read_text() == value
+    assert stat.S_IMODE(secret_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(secret_file.stat().st_mode) == 0o444
+    assert stat.S_IMODE(config_file.stat().st_mode) == 0o444
+    assert value not in config_file.read_text()
+
+
+def test_interceptor_startup_error_includes_stderr(tmp_path):
+    from subprocess import CompletedProcess
+    from agentbench.runtime.docker.runtime import DockerRuntime, DockerRuntimeError
+
+    runtime = object.__new__(DockerRuntime)
+    runtime.control = SimpleNamespace(check=lambda: None)
+    runtime._limits = SimpleNamespace(startup_seconds=1)
+
+    def run_quiet(*args, **_kwargs):
+        if args[:2] == ('logs', 'interceptor'):
+            return CompletedProcess(args, 1, '', 'PermissionError: unreadable mounted config')
+        return CompletedProcess(args, 0, 'false', '')
+
+    runtime._run_quiet = run_quiet
+    with pytest.raises(DockerRuntimeError, match='PermissionError: unreadable mounted config'):
+        runtime._wait_for_interceptor('interceptor', tmp_path / 'ca.pem')
 
 
 def test_docker_runtime_uses_only_resolved_mcp_values_for_redaction(tmp_path):

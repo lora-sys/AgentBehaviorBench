@@ -89,12 +89,8 @@ class ContainerSDKRunner:
                           agent_id=registration.agent_id, artifact_directory=str(directory),
                           detail='SDK artifacts available')
         return run_evaluation(registration, context=context, output=self.output,
-            settings=settings, stage_agent=self._stage_agent(context), timeout=self.timeout,
+            settings=settings, stage_agent=self.plugin.stage_agent, timeout=self.timeout,
             on_artifacts_ready=ready, **kwargs)
-
-    def _stage_agent(self, context):
-        """Return the SDK-specific controller image staging context manager."""
-        return self.plugin.stage_agent
 
     def prepare_cases(self, registration, *, on_progress=None):
         self.validate_sdk(registration)
