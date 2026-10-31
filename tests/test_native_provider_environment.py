@@ -55,20 +55,49 @@ def test_shared_provider_credential_is_mapped_to_agent_variables(tmp_path):
     assert 'worker_env_keys' not in (root / 'agent.toml').read_text()
 
 
-def test_native_runner_excludes_model_key_from_controller(monkeypatch, tmp_path):
+def test_native_runner_excludes_model_credentials_from_controller(monkeypatch, tmp_path):
     captured = {}
+
+    root = tmp_path / 'unit'
+    root.mkdir()
+    (root / 'agent.toml').write_text(
+        'schema_version = "defuzex-bench.agent.v2"\n'
+        'agent_id = "provider-fixture"\nframework = "acp"\n'
+        '[runtime]\ntype = "docker"\nworker_env_keys = ["STEPFUN_API_KEY"]\n'
+        '[build]\ncontext = "."\ndockerfile = "Dockerfile"\n'
+        '[launch]\nargv = ["python", "agent.py"]\n'
+        '[llm_interception]\nmode = "observe"\n')
+    catalog = tmp_path / 'providers.toml'
+    catalog.write_text(
+        'priority = ["stepfun"]\n'
+        '[providers.stepfun]\n'
+        'credential_env = "STEPFUN_API_KEY"\n'
+        'model_env = "STEPFUN_MODEL"\n'
+        'base_url_env = "STEPFUN_BASE_URL"\n'
+        'base_url = "https://api.stepfun.com/step_plan/v1"\n'
+        'target_plugin = "compatible-json"\n'
+        '[providers.stepfun.endpoint_paths]\n'
+        '"/chat/completions" = "/chat/completions"\n')
 
     def run_evaluation(registration, **kwargs):
         captured.update(kwargs)
         return 'run result'
 
     monkeypatch.setattr(integration_runner, 'run_evaluation', run_evaluation)
-    context = SimpleNamespace(environ={}, model='step-5-preview')
+    secret = '{{SYNTHETIC_STEPFUN_SECRET}}'
+    context = SimpleNamespace(environ={
+        'ABB_MODEL': 'environment-default',
+        'ABB_MODEL_PROVIDER': 'stepfun',
+        'ABB_MODEL_PROVIDERS_CONFIG': str(catalog),
+        'STEPFUN_API_KEY': secret,
+    }, model='step-5-preview')
     runner = NativeRunner(plugin, context=context, options={})
-    result = runner._run(object(), settings={}, context=context, on_progress=None)
+    result = runner._run(SimpleNamespace(path=root), settings={}, context=context, on_progress=None)
 
     assert result == 'run result'
-    assert captured['excluded_controller_environment'] == ('ABB_AGENT_MODEL_API_KEY',)
+    assert captured['excluded_controller_environment'] == (
+        'ABB_AGENT_MODEL_API_KEY', 'STEPFUN_API_KEY')
+    assert secret not in str(captured['excluded_controller_environment'])
 
 
 def test_container_environment_keeps_values_out_of_docker_argv():
